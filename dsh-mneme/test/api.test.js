@@ -754,7 +754,11 @@ test("GET /api/dsh-mneme/features returns empty overrides and effective config d
   // 不需要 NESTED_FLAG_PATHS 条目）= 104。
   // 人格寻址口径新增 personaStrictAddressing（顶层扁平键，同上）= 105。
   // issue #497 新增 profileExtractEnabled（画像提取草稿；顶层扁平键，同上）= 106。
-  assert.equal(Object.keys(data.effective).length, 106);
+  // issue #529 新增 sleepConflictMaxPairs / sleepConflictMaxPairsPerRun（冲突阶段的
+  // 输入侧预算，两个 int 键都走 INT_RANGES 表）= 108。
+  // issue #529 再新增 sleepFailureBackoff（sleep 连续失败退避；顶层布尔键，
+  // 不需要 NESTED_FLAG_PATHS 条目）= 109。
+  assert.equal(Object.keys(data.effective).length, 109);
   assert.equal(data.effective.dreamSkipInvalid, true);
   assert.equal(data.effective.allowCrossTypeMerge, false);
   assert.equal(data.effective.dreamMergeGuard, true);
