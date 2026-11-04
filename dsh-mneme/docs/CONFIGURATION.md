@@ -177,6 +177,8 @@
 | `dreamIncrementalReview` | `false` | 增量送审：两条线逐条阶梯（整理 1/4/12/24h、扫描 1/4/8/12×4h 后沉底）+ BM25 邻居陪绑 + 全量兜底（设计 §3/§5） | 状态存 side 表 `review_state`，失败轮不提交；关 = 逐字节现状 |
 | `dreamIncrementalNeighborK` | `3` | 每个种子（新条目/哈希变化）的陪绑邻居数，扫描线用 k+2（1–20） | 整理线每组上限 60、扫描线全局 150（硬编码） |
 | `dreamIncrementalFullReviewDays` | `7` | 全量兜底周期：距 `last_full_review_at` ≥ N 天 → 本轮忽略阶梯全量送审（1–90） | 兜底轮成功（ok）后才刷新时间戳；沉底条目兜底轮也不送审 |
+| `dreamAgedArchiveDays` | `0` | 365 天确定性归档：每次点火开头把 `updated_at` 早于 now−N 天的 eligible 行直接归档（0–3650，consolidation 设计 §6） | `0` = 关（逐字节现状）；不走 LLM、不占每类型归档预算；只改 archived/archived_at，正文不动，可 `setArchived(id,false)` 恢复；计入 applied（纯归档轮 status=ok） |
+| `dreamAgedArchiveMaxPerRun` | `50` | 单轮确定性归档条数上限（1–500），按 updated_at 升序取最旧 | 独立预算，防首次开启时一次性大批归档；触顶时 `outcome.aged_archive.capped=true` |
 | `allowCrossTypeMerge` | `false` | 放宽跨类型合并检查 | opt-in；`dreamSkipInvalid` 关时跨类型 merge 直接整单拒绝 |
 | `dreamMergeGuard` | `true` | guarded 类型 merge 护栏（#339/E8）：合并对象命中长保留类型（与 archive 护栏同表：preference/pattern/rejected_solution/constraint/pitfall）的 merge 决策跳过——E8 实测巩固损耗里 10/26 条被丢约束已归位 guarded 类型仍被 merge 吃掉。**#521 起带逃生门**：所有 id 同类型且 `reason` 命中「重复/过时」词表（与 archive 护栏同一份 `ARCHIVE_RATIONALE_RE`）时放行——archive 早就有这道门，merge 没有，于是一份真重复的 preference 永远合不掉而提示词还在催模型合并它 | 默认开（同类压缩管线实测：安全规则被同速压缩后一轮只剩 53%、五轮只剩 10%，全程无报错）；关闭 = guarded 类型的 merge 不再被跳过，「更精炼的摘要」重新成为约束失真的主通道。`dreamSkipInvalid`（默认开）时被跳条目进 `dream_runs.skipped`、run 记 degraded，关闭时整单拒绝 |
 | `dreamNarrativeEnabled` **light** | `false` | dream 期间按共享 tag 聚类合成叙述条（#164 对齐） | opt-in；按需检索、不常驻注入 |

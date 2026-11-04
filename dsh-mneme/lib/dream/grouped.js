@@ -63,6 +63,35 @@ export async function runGroupedDream(ctx, service, config, helpers) {
   const nowMs = typeof helpers.now === "function" ? helpers.now() : Date.now();
   const ledgerOn = config.dreamLedgerExtended === true;
   const started = new Date().toISOString(), runId = randomUUID(), route = resolveRoute(ctx, config, logger);
+  // ── 365 天确定性归档（§6，dreamAgedArchiveDays>0 才启用；0/缺省 = 逐字节现状）──
+  // 先归档、后取 eligible：归档行退出 eligible，自然不进增量选窗的 due/notDue/sunk
+  // 统计，也不进两条线的任何载荷。不走 LLM、不占 limits/budget（独立上限只为防
+  // 首次开启时一次性大批归档）；归档计入 applied，使纯归档轮 status 为 ok 而非 noop。
+  // 只改 archived/archived_at（setArchived 会顶推 updated_at，但 cutoff 已按归档前
+  // 快照算完），正文不动，可用 setArchived(id,false) 恢复。
+  const agedDays = Number.isInteger(config.dreamAgedArchiveDays) && config.dreamAgedArchiveDays > 0 ? config.dreamAgedArchiveDays : 0;
+  const aged = { days: agedDays, cutoff: null, ids: [], count: 0, capped: false, records: [], errors: [] };
+  const agedDecisions = [];
+  if (agedDays > 0) {
+    const cap = Number.isInteger(config.dreamAgedArchiveMaxPerRun) ? Math.max(1, Math.min(500, config.dreamAgedArchiveMaxPerRun)) : 50;
+    const cutoffMs = nowMs - agedDays * 86400e3;
+    aged.cutoff = new Date(cutoffMs).toISOString();
+    const agedRows = eligible(service)
+      .filter(m => { const t = Date.parse(String(m.updated_at ?? "")); return Number.isFinite(t) && t < cutoffMs; })
+      .sort((a, b) => String(a.updated_at).localeCompare(String(b.updated_at)) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+    aged.capped = agedRows.length > cap;
+    for (const m of agedRows.slice(0, cap)) {
+      try {
+        const after = service.setArchived(m.id, true);
+        aged.ids.push(m.id); aged.count++;
+        agedDecisions.push({ action: "archive", ids: [m.id], reason: `aged_archive: updated_at>=${agedDays}d`, source: "deterministic" });
+        // 可追溯性：buildRecordReceipts 没有 archive 分支（LLM 归档同样不产 receipt，
+        // §6「与 LLM 归档同口径」= 同一零产出通道），归档前证据链因此写进
+        // outcome.aged_archive.records（ids + 归档前 evidence + archived_at）。
+        aged.records.push({ id: m.id, evidence: evidence(m), archived_at: after?.archived_at ?? new Date(nowMs).toISOString() });
+      } catch (error) { aged.errors.push({ id: m.id, error: String(error) }); logger?.warn?.(`aged archive failed for ${m.id}: ${String(error)}`); }
+    }
+  }
   const initialEligible = eligible(service);
   // ── 增量送审选窗（§3.2/§5，dreamIncrementalReview，默认关 = 逐字节现状）──
   // 两条 lane 各自读 review_state 算到期性；全量兜底（§5.2）由 review_meta
@@ -101,12 +130,18 @@ export async function runGroupedDream(ctx, service, config, helpers) {
   const snapshotHash = hashSnapshot([...snapshot.values()]);
   const outcome = { byId: {}, mode: "grouped", groups: [], degradations: [], sweep: null, conflicts: [], failures: [], cross_type_candidates: [], skippedUnsupportedTypes: unsupported.map(evidence) };
   const decisions = [], committed = [], usage = [], adjudicationSkipped = [];
+  // 审计块只在开关开时出现（关 = outcome 逐字节现状）；decisions 里的确定性条目
+  // 指向已退出 eligible 的 id，后续整理线归纳（mark 只认 due/neighbors）不受影响。
+  if (agedDays > 0) outcome.aged_archive = { days: aged.days, cutoff: aged.cutoff, ids: aged.ids, count: aged.count, capped: aged.capped, records: aged.records, ...(aged.errors.length ? { errors: aged.errors } : {}) };
+  decisions.push(...agedDecisions);
   const claims = new Set(), budget = new Map();
   const limits = {update: config.reflectionUpdateMaxPerRun ?? 2, archive: config.dreamMaxArchivePerRun ?? 8, merge: config.dreamMaxMergePerRun ?? 40};
   const spent = type => { if(!budget.has(type)) budget.set(type,{update:0,archive:0,merge:0}); return budget.get(type); };
   const remaining = type => Object.fromEntries(Object.entries(limits).map(([a,n]) => [`max${a[0].toUpperCase()+a.slice(1)}PerRun`,Math.max(0,n-spent(type)[a])]));
   const account = (items,snap) => { for(const d of items) if(d.action !== "keep") { const ids=d.action === "conflict"||d.action === "supersede" ? [d.winner,d.loser] : d.ids; ids.forEach(id=>claims.add(id)); for(const type of new Set(ids.map(id=>snap.get(id)?.type))) if(d.action in limits) spent(type)[d.action]++; if(d.action === "conflict"||d.action === "supersede") spent(snap.get(d.loser)?.type).archive++; } };
   let applied = 0, summaryStored = false, failedStages = 0, degraded = unsupported.length > 0, frozen = 0, ledgerFilteredDecisions = 0;
+  // §6：归档本身算 applied（不占 budget/limits，不经 account()），纯归档轮 → ok。
+  applied += aged.count;
   // Truncation still drops rows exactly as before; this only removes the silence (degraded, never a failed stage).
   for (const g of groups) if (g.truncation) { degraded = true; outcome.degradations.push({ kind: "consolidation_truncated", group: g.types.join("+"), ...g.truncation }); }
   // §8：被截断丢弃的行阶梯记 hold（下次点火重新到期），只对入过窗的到期行生效。

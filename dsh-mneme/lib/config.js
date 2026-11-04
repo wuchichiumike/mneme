@@ -269,6 +269,12 @@ export const Config = z.object({
   dreamIncrementalNeighborK: z.natural().min(1).max(20).default(3),
   // 全量兜底周期（天）：距上次全量 ≥ N 天 → 本轮忽略阶梯全量送审。1-90，默认 7。
   dreamIncrementalFullReviewDays: z.natural().min(1).max(90).default(7),
+  // 365 天确定性归档（consolidation 设计文档 §6）：每次点火开头把 updated_at 早于
+  // now-N 天的 eligible 行直接归档（只改 archived/archived_at，正文不动，可用
+  // setArchived(id,false) 恢复）。不走 LLM、不占每类型归档预算。0 = 关（现状）。
+  dreamAgedArchiveDays: z.natural().max(3650).default(0),
+  // 单轮确定性归档条数上限（1-500，默认 50）：防首次开启时一次性大批归档。
+  dreamAgedArchiveMaxPerRun: z.natural().min(1).max(500).default(50),
   // Issue #104 方向 2：单轮 archive 决策上限。一次性大扫除（12 条互不相关主题
   // 被批量归档，其中 8 条疑似误伤长保留类型）是失控信号，与 update 上限同类的
   // 全局闸门：skipInvalid 也不豁免，超限整单拒绝。正常清理可调高。
