@@ -207,6 +207,34 @@ CREATE TABLE IF NOT EXISTS conflict_resolutions (
 CREATE INDEX IF NOT EXISTS idx_conflict_resolutions_id_a ON conflict_resolutions(id_a);
 CREATE INDEX IF NOT EXISTS idx_conflict_resolutions_id_b ON conflict_resolutions(id_b);
 
+-- review_state: 增量送审阶梯（设计文档 §3.1）。每条记忆在每条线（consolidation /
+-- sweep）上各一行：strict_hash = 上次清白送审时的严格哈希（正文变了 → 回窗重置），
+-- streak = 已完成的清白阶数，next_due_at 为 ISO（NULL = 立即到期），sunk = 最后一阶
+-- 期满未变后沉底（不再送审，直到哈希变化）。主键 (memory_id, lane)：两条阶梯长度和
+-- 沉底规则都不同，用行而不是列表达，加第三条线不用迁移。与 conflict_resolutions
+-- 同款纯 bookkeeping 表：写入不经过 setArchived/update，不触发 write hook、不刷
+-- memories.updated_at（365 天归档规则的锚不能被送审状态刷新）。
+CREATE TABLE IF NOT EXISTS review_state (
+  memory_id      TEXT NOT NULL,
+  lane           TEXT NOT NULL,
+  strict_hash    TEXT,
+  streak         INTEGER NOT NULL DEFAULT 0,
+  next_due_at    TEXT,
+  sunk           INTEGER NOT NULL DEFAULT 0,
+  last_reviewed_at TEXT,
+  last_run_id    TEXT,
+  updated_at     TEXT NOT NULL,
+  PRIMARY KEY (memory_id, lane)
+);
+
+-- review_meta: 送审侧的全局小状态（key → value，如 last_full_review_at，§3.1/§8）。
+-- 同 bookkeeping 口径：不触发 write hook。
+CREATE TABLE IF NOT EXISTS review_meta (
+  key        TEXT PRIMARY KEY,
+  value      TEXT,
+  updated_at TEXT NOT NULL
+);
+
 -- scope_changes: v0.8.1 底座（issue #170）scope 归属的人工修正审计。显式声明
 -- （memory_save/memory_update 的 scope 参数、面板编辑）每次改变某条记忆的
 -- agent/workspace 归属都落一行：改动前后值 + 来源 + actor（tool=模型侧 /
@@ -671,6 +699,30 @@ function toConflictResolution(row) {
     model: row.model ?? null,
     run_id: row.run_id ?? undefined,
     decided_at: row.decided_at,
+    updated_at: row.updated_at,
+    // 台账四态（§4.1）新增列。老库行补齐后为 NULL/0，与现行行为一致。
+    strict_hash_a: row.strict_hash_a ?? null,
+    strict_hash_b: row.strict_hash_b ?? null,
+    guard: row.guard ?? null,
+    cooldown_until: row.cooldown_until ?? null,
+    fail_count: row.fail_count ?? 0,
+    fail_reason: row.fail_reason ?? null,
+    needs_human: row.needs_human ?? 0
+  };
+}
+
+// review_state 行 → 读侧对象（阶梯纯函数 review-ladder.js 的 state 入参形状）。
+function toReviewState(row) {
+  if (!row) return undefined;
+  return {
+    memory_id: row.memory_id,
+    lane: row.lane,
+    strict_hash: row.strict_hash ?? null,
+    streak: row.streak,
+    next_due_at: row.next_due_at ?? null,
+    sunk: row.sunk,
+    last_reviewed_at: row.last_reviewed_at ?? null,
+    last_run_id: row.last_run_id ?? null,
     updated_at: row.updated_at
   };
 }
@@ -1022,6 +1074,20 @@ export function createStore(path) {
   // 之后：老库打开时列还不存在（SCHEMA 的 CREATE TABLE 只对新建库生效）。
   addColumn("llm_audit_logs", "session_key", "ALTER TABLE llm_audit_logs ADD COLUMN session_key TEXT");
   db.exec("CREATE INDEX IF NOT EXISTS idx_llm_audit_session ON llm_audit_logs(session_key);");
+
+  // 台账四态（设计文档 §4.1）：conflict_resolutions 从「显式 keep 台账」泛化成
+  // 统一裁决台账。存量库的表是旧版 CREATE TABLE 建的，SCHEMA 的 CREATE TABLE
+  // IF NOT EXISTS 对既有表不生效，所以新列走 addColumn 幂等惯例补齐。verdict
+  // 取值扩展为 keep|applied|guard_rejected|invalid——列本来就是 TEXT，无需改约束。
+  // NOT NULL DEFAULT 0 的两列（fail_count/needs_human）存量行自动落 0 = 现行语义；
+  // 其余可空列落 NULL = 「未标注」，读取端把 NULL 当现行行为。
+  addColumn("conflict_resolutions", "strict_hash_a", "ALTER TABLE conflict_resolutions ADD COLUMN strict_hash_a TEXT");
+  addColumn("conflict_resolutions", "strict_hash_b", "ALTER TABLE conflict_resolutions ADD COLUMN strict_hash_b TEXT");
+  addColumn("conflict_resolutions", "guard", "ALTER TABLE conflict_resolutions ADD COLUMN guard TEXT");
+  addColumn("conflict_resolutions", "cooldown_until", "ALTER TABLE conflict_resolutions ADD COLUMN cooldown_until TEXT");
+  addColumn("conflict_resolutions", "fail_count", "ALTER TABLE conflict_resolutions ADD COLUMN fail_count INTEGER NOT NULL DEFAULT 0");
+  addColumn("conflict_resolutions", "fail_reason", "ALTER TABLE conflict_resolutions ADD COLUMN fail_reason TEXT");
+  addColumn("conflict_resolutions", "needs_human", "ALTER TABLE conflict_resolutions ADD COLUMN needs_human INTEGER NOT NULL DEFAULT 0");
 
   // Audit peer F: a legacy DB may hold a non-integer generation/applied_generation
   // (pre-v0.3.9 the JS gate truncated with Math.trunc and SQLite's CHECK only
@@ -2942,17 +3008,29 @@ export function createStore(path) {
    * keep、拒绝隐式/截断/未表态）住在裁决器调用侧，本函数只做落库与 reason 截断
    * （512 字符，够人工回看；全文可凭 run_id 查 dream_runs.decisions）。
    */
-  function upsertConflictResolution({ pair_key, id_a, id_b, hash_a = null, hash_b = null, verdict = "keep", relation = null, reason = null, model = null, run_id = null }) {
+  function upsertConflictResolution({
+    pair_key, id_a, id_b, hash_a = null, hash_b = null, verdict = "keep", relation = null, reason = null, model = null, run_id = null,
+    // 台账四态（§4.1/§4.2）新增字段。缺省 = 现行行为：strict/guard/cooldown 落
+    // NULL（读取端把 NULL 当「未标注」，走老口径），fail_count/needs_human 落 0。
+    // fail_count 的 +1/清零规则住在写入侧调用方（裁决器，§4.2），本函数只落值。
+    strict_hash_a = null, strict_hash_b = null, guard = null, cooldown_until = null,
+    fail_count = 0, fail_reason = null, needs_human = 0
+  }) {
     if (!pair_key || !id_a || !id_b) throw new Error("conflict_resolutions: pair_key/id_a/id_b are required");
     const now = nowIso();
     db.prepare(
-      `INSERT INTO conflict_resolutions (pair_key, id_a, id_b, hash_a, hash_b, verdict, relation, reason, model, run_id, decided_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO conflict_resolutions (pair_key, id_a, id_b, hash_a, hash_b, verdict, relation, reason, model, run_id, decided_at, updated_at,
+         strict_hash_a, strict_hash_b, guard, cooldown_until, fail_count, fail_reason, needs_human)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(pair_key) DO UPDATE SET
          id_a = excluded.id_a, id_b = excluded.id_b, hash_a = excluded.hash_a, hash_b = excluded.hash_b,
          verdict = excluded.verdict, relation = excluded.relation, reason = excluded.reason,
-         model = excluded.model, run_id = excluded.run_id, decided_at = excluded.decided_at, updated_at = excluded.updated_at`
-    ).run(pair_key, id_a, id_b, hash_a, hash_b, verdict, relation, String(reason ?? "").slice(0, 512) || null, model, run_id, now, now);
+         model = excluded.model, run_id = excluded.run_id, decided_at = excluded.decided_at, updated_at = excluded.updated_at,
+         strict_hash_a = excluded.strict_hash_a, strict_hash_b = excluded.strict_hash_b, guard = excluded.guard,
+         cooldown_until = excluded.cooldown_until, fail_count = excluded.fail_count,
+         fail_reason = excluded.fail_reason, needs_human = excluded.needs_human`
+    ).run(pair_key, id_a, id_b, hash_a, hash_b, verdict, relation, String(reason ?? "").slice(0, 512) || null, model, run_id, now, now,
+      strict_hash_a, strict_hash_b, guard, cooldown_until, Number.isInteger(fail_count) ? fail_count : 0, fail_reason, needs_human ? 1 : 0);
     return getConflictResolution(pair_key);
   }
 
@@ -2970,6 +3048,67 @@ export function createStore(path) {
     return db.prepare(
       "SELECT * FROM conflict_resolutions WHERE id_a = ? OR id_b = ? ORDER BY updated_at DESC, pair_key"
     ).all(id, id).map(toConflictResolution);
+  }
+
+  /**
+   * 阶梯台账（§3.1）读侧：一条 lane 的全部（或指定 ids 的）review_state，
+   * Map(memory_id → row)。ids 传空数组 → 空 Map（不查全表）。选窗阶段一次批量
+   * 取回，纯函数 isDue/nextState 在内存里判定，不做逐条查询。
+   */
+  function getReviewStates(lane, ids) {
+    const out = new Map();
+    if (Array.isArray(ids) && ids.length === 0) return out;
+    const rows = Array.isArray(ids)
+      ? db.prepare("SELECT * FROM review_state WHERE lane = ? AND memory_id IN (%s)".replace("%s", ids.map(() => "?").join(",")))
+        .all(lane, ...ids)
+      : db.prepare("SELECT * FROM review_state WHERE lane = ?").all(lane);
+    for (const row of rows) out.set(row.memory_id, toReviewState(row));
+    return out;
+  }
+
+  /**
+   * 阶梯台账写侧：一批（同 lane 的）状态覆盖式 upsert，单事务提交——§3.3 的
+   * 提交时机是「finish() 判定 ok 后统一提交」，半途崩溃不能留下半条阶梯。
+   * 每条 row 需带 memory_id；updated_at 缺省取当前时刻。
+   */
+  function upsertReviewStates(lane, rows = []) {
+    if (!lane) throw new Error("review_state: lane is required");
+    if (!Array.isArray(rows)) throw new Error("review_state: rows must be an array");
+    return runAtomically(() => {
+      const stmt = db.prepare(
+        `INSERT INTO review_state (memory_id, lane, strict_hash, streak, next_due_at, sunk, last_reviewed_at, last_run_id, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(memory_id, lane) DO UPDATE SET
+           strict_hash = excluded.strict_hash, streak = excluded.streak, next_due_at = excluded.next_due_at,
+           sunk = excluded.sunk, last_reviewed_at = excluded.last_reviewed_at,
+           last_run_id = excluded.last_run_id, updated_at = excluded.updated_at`
+      );
+      const now = nowIso();
+      for (const row of rows) {
+        if (!row?.memory_id) throw new Error("review_state: memory_id is required");
+        stmt.run(
+          row.memory_id, lane, row.strict_hash ?? null, row.streak ?? 0, row.next_due_at ?? null,
+          row.sunk ? 1 : 0, row.last_reviewed_at ?? null, row.last_run_id ?? null, row.updated_at ?? now
+        );
+      }
+      return rows.length;
+    });
+  }
+
+  /** review_meta 单键读取；未设置返回 undefined（与 getScopeState 同口径）。 */
+  function getReviewMeta(key) {
+    const row = db.prepare("SELECT value FROM review_meta WHERE key = ?").get(key);
+    return row?.value;
+  }
+
+  /** review_meta 单键写入（覆盖式）。value 由调用方序列化成字符串（ISO 时间戳等）。 */
+  function setReviewMeta(key, value) {
+    if (!key) throw new Error("review_meta: key is required");
+    db.prepare(
+      `INSERT INTO review_meta (key, value, updated_at) VALUES (?, ?, ?)
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`
+    ).run(key, value ?? null, nowIso());
+    return getReviewMeta(key);
   }
 
   /**
@@ -3762,6 +3901,11 @@ export function createStore(path) {
     upsertConflictResolution,
     getConflictResolution,
     listConflictResolutionsForMemory,
+    // 增量送审阶梯（§3.1）：side 表 bookkeeping，不挂 write hooks。
+    getReviewStates,
+    upsertReviewStates,
+    getReviewMeta,
+    setReviewMeta,
     saveScopeChange,
     listScopeChanges,
     // 政策轴（issue #471）：按下/松开一个作用域。纯 bookkeeping，不调

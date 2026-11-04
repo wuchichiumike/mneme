@@ -52,3 +52,18 @@ export function contentHashOf(memory) {
   if (!title && !content) return null;
   return createHash("sha256").update(`${title}\u0000${content}`).digest("hex");
 }
+
+/**
+ * 送审阶梯的正文锚（设计文档 §3.1）：与 contentHashOf 同形状（title NUL content
+ * 取 sha256），但**不做任何归一化**——`版本 3.5` 与 `版本 35` 在这里是两个键，
+ * 这正是阶梯要的语义：格式/标点级的改动也算「正文变了 → 回窗重审」。
+ * 空串照常哈希，永不返回 null：阶梯需要一个永不为 NULL 的比较锚，
+ * 「没有内容」本身也是一种内容状态。与 service.js 镜像 digest 同口径。
+ * @param {{title?: string, content?: string}|null|undefined} memory
+ * @returns {string} 十六进制全串
+ */
+export function strictHashOf(memory) {
+  const title = memory?.title ?? "";
+  const content = memory?.content ?? "";
+  return createHash("sha256").update(`${title}\u0000${content}`).digest("hex");
+}

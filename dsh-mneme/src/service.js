@@ -2829,6 +2829,13 @@ export function createService({ store, mirror, config, onWrite, logger, document
     upsertConflictResolution: (r) => store.upsertConflictResolution(r),
     getConflictResolution: (k) => store.getConflictResolution(k),
     listConflictResolutionsForMemory: (id) => store.listConflictResolutionsForMemory(id),
+    // 增量送审阶梯（§3.1/§3.3）：review_state / review_meta 是纯 bookkeeping side 表，
+    // 同上面台账透传的口径——不动记忆行、不触发 write hook、不刷 updated_at。
+    // dream 侧（grouped 选窗读、finish ok 后批量写）只认 service 这一个入口。
+    getReviewStates: (lane, ids) => store.getReviewStates(lane, ids),
+    upsertReviewStates: (lane, rows) => store.upsertReviewStates(lane, rows),
+    getReviewMeta: (key) => store.getReviewMeta(key),
+    setReviewMeta: (key, value) => store.setReviewMeta(key, value),
     // Recall evaluation trail (方案 B): audit-bookkeeping semantics like the
     // dream/recall passthroughs above — a recall_evals write is a snapshot, not
     // a memory mutation, so it never triggers write hooks.
