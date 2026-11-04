@@ -262,6 +262,13 @@ export const Config = z.object({
   dreamGroupedWindow: z.natural().min(1).max(500).default(500),
   // 台账四态 + 白卷批级重试（consolidation 设计文档 §4/§7）。关 = 现行行为逐字节不变。
   dreamLedgerExtended: z.boolean().default(false),
+  // 增量送审（consolidation 设计文档 §3/§5）：两条线逐条阶梯 + BM25 邻居陪绑 +
+  // 每 N 天全量兜底。关 = 逐字节现状（review_state 表整张不读）。
+  dreamIncrementalReview: z.boolean().default(false),
+  // 整理线每个种子的陪绑邻居数（扫描线用 k+2）。1-20，默认 3。
+  dreamIncrementalNeighborK: z.natural().min(1).max(20).default(3),
+  // 全量兜底周期（天）：距上次全量 ≥ N 天 → 本轮忽略阶梯全量送审。1-90，默认 7。
+  dreamIncrementalFullReviewDays: z.natural().min(1).max(90).default(7),
   // Issue #104 方向 2：单轮 archive 决策上限。一次性大扫除（12 条互不相关主题
   // 被批量归档，其中 8 条疑似误伤长保留类型）是失控信号，与 update 上限同类的
   // 全局闸门：skipInvalid 也不豁免，超限整单拒绝。正常清理可调高。

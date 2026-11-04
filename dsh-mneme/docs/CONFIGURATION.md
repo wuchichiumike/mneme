@@ -163,6 +163,8 @@
 | `dreamSummaryProvider` / `dreamSummaryModel` | 空 | 记忆总览（dream_summarize）专用路由（#258） | 空 = 回落巩固路由；总览输入为全库，建议大 ctx 非思考模型 |
 | `dreamSummaryMaxInputs` | `0` | 总览输入条数硬上限（按 updated_at 倒序取最新 N 条） | 0 = 不设上限（库增长可能撑爆小 ctx 模型） |
 | `dreamMaxSnapshotSize` | `200` | 滑动窗口：每次只巩固最近 N 条（≤1000） | 窗口外旧记忆不进快照 |
+| `dreamConsolidationMode` | `legacy` | 巩固路径：`legacy` / `grouped`（分组整理 + 扫描 + 全文裁决） | `grouped` 为 opt-in 实验路径，legacy 契约不变 |
+| `dreamGroupedWindow` | `500` | grouped 路径每个类型包的独立输入窗口（1–500） | 各组独立取最新 N 条，超出记 `consolidation_truncated` 降级 |
 | `dreamCandidateMode` | `window` | 候选集构造：`window` / `hybrid`（并入向量高相似组，#125） | `hybrid` 让该合并的对能碰面；输入成本不随库增长 |
 | `dreamCandidateMax` | `0` | `hybrid` 候选总量上限（≤5000） | 0 = 复用 `dreamMaxSnapshotSize` |
 | `dreamCandidateMinSim` | `0.85` | `hybrid` 判「高相似」的阈值 | 与 sleep normal 档同一个定义 |
@@ -171,6 +173,10 @@
 | `dreamImplicitKeep` | `true` | LLM 未提及的快照记忆自动补 keep | `false` = 恢复严格校验（未覆盖即拒绝整单） |
 | `dreamMinExplicitCoverage` | `0.5` | 显式决策覆盖率下限（0–1） | 防截断输出被隐式 keep 洗白 |
 | `dreamSkipInvalid` | `true` | 跳过单条非法决策、应用合法子集、run 记 degraded（#89） | `false` = 恢复整单拒绝 |
+| `dreamLedgerExtended` | `false` | 台账四态（keep/applied/guard_rejected/invalid）+ 白卷批级重试 + 整理线决定台账过滤（consolidation 设计 §4/§7） | 开 = 暂时护栏/白卷 24h 冷却、同因 3 次 7d 待人工；关 = 逐字节现状 |
+| `dreamIncrementalReview` | `false` | 增量送审：两条线逐条阶梯（整理 1/4/12/24h、扫描 1/4/8/12×4h 后沉底）+ BM25 邻居陪绑 + 全量兜底（设计 §3/§5） | 状态存 side 表 `review_state`，失败轮不提交；关 = 逐字节现状 |
+| `dreamIncrementalNeighborK` | `3` | 每个种子（新条目/哈希变化）的陪绑邻居数，扫描线用 k+2（1–20） | 整理线每组上限 60、扫描线全局 150（硬编码） |
+| `dreamIncrementalFullReviewDays` | `7` | 全量兜底周期：距 `last_full_review_at` ≥ N 天 → 本轮忽略阶梯全量送审（1–90） | 兜底轮成功（ok）后才刷新时间戳；沉底条目兜底轮也不送审 |
 | `allowCrossTypeMerge` | `false` | 放宽跨类型合并检查 | opt-in；`dreamSkipInvalid` 关时跨类型 merge 直接整单拒绝 |
 | `dreamMergeGuard` | `true` | guarded 类型 merge 护栏（#339/E8）：合并对象命中长保留类型（与 archive 护栏同表：preference/pattern/rejected_solution/constraint/pitfall）的 merge 决策跳过——E8 实测巩固损耗里 10/26 条被丢约束已归位 guarded 类型仍被 merge 吃掉。**#521 起带逃生门**：所有 id 同类型且 `reason` 命中「重复/过时」词表（与 archive 护栏同一份 `ARCHIVE_RATIONALE_RE`）时放行——archive 早就有这道门，merge 没有，于是一份真重复的 preference 永远合不掉而提示词还在催模型合并它 | 默认开（同类压缩管线实测：安全规则被同速压缩后一轮只剩 53%、五轮只剩 10%，全程无报错）；关闭 = guarded 类型的 merge 不再被跳过，「更精炼的摘要」重新成为约束失真的主通道。`dreamSkipInvalid`（默认开）时被跳条目进 `dream_runs.skipped`、run 记 degraded，关闭时整单拒绝 |
 | `dreamNarrativeEnabled` **light** | `false` | dream 期间按共享 tag 聚类合成叙述条（#164 对齐） | opt-in；按需检索、不常驻注入 |

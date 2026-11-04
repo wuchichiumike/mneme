@@ -6,6 +6,7 @@ import { scopeKeyOf } from "../scope.js";
 import { adjudicateCandidates } from "./adjudication.js";
 import { contentHashOf, strictHashOf } from "../content-hash.js";
 import { STR, langOf } from "../lang.js";
+import { isFullReview, selectDue, pickNeighbors, buildCommitRows, DAY_MS, CONSOLIDATION_NEIGHBOR_CAP, SWEEP_NEIGHBOR_CAP } from "./incremental.js";
 
 // 出口1（resolved_keep 台账）读取端 TTL：超过 30 天的 keep 结论重新送审
 // （语义可能随库演化漂移，长期结论要定期复损）。upsert 会刷新 decided_at，
@@ -63,7 +64,38 @@ export async function runGroupedDream(ctx, service, config, helpers) {
   const ledgerOn = config.dreamLedgerExtended === true;
   const started = new Date().toISOString(), runId = randomUUID(), route = resolveRoute(ctx, config, logger);
   const initialEligible = eligible(service);
-  const groups = consolidationGroups(initialEligible, Number.isInteger(config.dreamGroupedWindow) ? Math.max(1, Math.min(CONSOLIDATION_GROUP_CAP, config.dreamGroupedWindow)) : CONSOLIDATION_GROUP_CAP);
+  // ── 增量送审选窗（§3.2/§5，dreamIncrementalReview，默认关 = 逐字节现状）──
+  // 两条 lane 各自读 review_state 算到期性；全量兜底（§5.2）由 review_meta
+  // last_full_review_at 距今 ≥ FullReviewDays 触发，兜底轮忽略阶梯但沉底条目
+  // 仍不送审（沉底只认哈希）。邻居陪绑的种子 = 到期行中「无 state 或严格哈希
+  // 已变」者，从非到期池（冷却中+沉底）按 BM25 词面相似度捞回窗。
+  const incrementalOn = config.dreamIncrementalReview === true;
+  const neighborK = Number.isInteger(config.dreamIncrementalNeighborK) ? Math.max(1, Math.min(20, config.dreamIncrementalNeighborK)) : 3;
+  const fullReviewDays = Number.isInteger(config.dreamIncrementalFullReviewDays) ? Math.max(1, Math.min(90, config.dreamIncrementalFullReviewDays)) : 7;
+  const groupCap = Number.isInteger(config.dreamGroupedWindow) ? Math.max(1, Math.min(CONSOLIDATION_GROUP_CAP, config.dreamGroupedWindow)) : CONSOLIDATION_GROUP_CAP;
+  const inc = {
+    enabled: incrementalOn, fullReview: false,
+    consolidation: { due: new Map(), sunk: new Map(), notDue: new Map(), neighbors: new Map(), states: new Map(), hold: new Set() },
+    sweep: { due: new Map(), sunk: new Map(), notDue: new Map(), neighbors: new Map(), states: new Map(), hold: new Set() }
+  };
+  if (incrementalOn) {
+    inc.fullReview = isFullReview(service.getReviewMeta?.("last_full_review_at"), nowMs, fullReviewDays);
+    const consStates = service.getReviewStates("consolidation");
+    inc.consolidation.states = consStates;
+    const consSel = selectDue("consolidation", initialEligible, consStates, nowMs, inc.fullReview);
+    for (const e of consSel.due) inc.consolidation.due.set(e.row.id, e);
+    for (const e of consSel.sunk) inc.consolidation.sunk.set(e.row.id, e);
+    for (const e of consSel.notDue) inc.consolidation.notDue.set(e.row.id, e);
+    // 整理线陪绑：逐组（同组类型内），k=NeighborK，每组上限 60（§5.1）。
+    const consPool = [...consSel.notDue, ...consSel.sunk].map(e => e.row);
+    for (const types of GROUPS) {
+      const seeds = consSel.due.filter(e => e.seed && types.includes(e.row.type)).map(e => e.row);
+      for (const m of pickNeighbors({ seeds, pool: consPool, corpus: initialEligible, k: neighborK, cap: CONSOLIDATION_NEIGHBOR_CAP, typesOf: () => types }))
+        inc.consolidation.neighbors.set(m.id, m);
+    }
+  }
+  const consWindowRows = incrementalOn ? [...initialEligible.filter(m => inc.consolidation.due.has(m.id)), ...inc.consolidation.neighbors.values()] : initialEligible;
+  const groups = consolidationGroups(consWindowRows, groupCap);
   const unsupported = initialEligible.filter(m => !GROUPS.flat().includes(m.type));
   const snapshot = new Map(groups.flatMap(g => g.rows).map(m => [m.id, m]));
   const snapshotHash = hashSnapshot([...snapshot.values()]);
@@ -74,15 +106,48 @@ export async function runGroupedDream(ctx, service, config, helpers) {
   const spent = type => { if(!budget.has(type)) budget.set(type,{update:0,archive:0,merge:0}); return budget.get(type); };
   const remaining = type => Object.fromEntries(Object.entries(limits).map(([a,n]) => [`max${a[0].toUpperCase()+a.slice(1)}PerRun`,Math.max(0,n-spent(type)[a])]));
   const account = (items,snap) => { for(const d of items) if(d.action !== "keep") { const ids=d.action === "conflict"||d.action === "supersede" ? [d.winner,d.loser] : d.ids; ids.forEach(id=>claims.add(id)); for(const type of new Set(ids.map(id=>snap.get(id)?.type))) if(d.action in limits) spent(type)[d.action]++; if(d.action === "conflict"||d.action === "supersede") spent(snap.get(d.loser)?.type).archive++; } };
-  let applied = 0, summaryStored = false, failedStages = 0, degraded = unsupported.length > 0, frozen = 0;
+  let applied = 0, summaryStored = false, failedStages = 0, degraded = unsupported.length > 0, frozen = 0, ledgerFilteredDecisions = 0;
   // Truncation still drops rows exactly as before; this only removes the silence (degraded, never a failed stage).
   for (const g of groups) if (g.truncation) { degraded = true; outcome.degradations.push({ kind: "consolidation_truncated", group: g.types.join("+"), ...g.truncation }); }
+  // §8：被截断丢弃的行阶梯记 hold（下次点火重新到期），只对入过窗的到期行生效。
+  const consTruncatedDropped = new Set();
+  if (incrementalOn) for (const g of groups) if (g.truncation) {
+    const sorted = consWindowRows.filter(m => g.types.includes(m.type)).sort(newestFirst);
+    for (const m of sorted.slice(groupCap)) if (inc.consolidation.due.has(m.id)) consTruncatedDropped.add(m.id);
+  }
   const finish = () => {
     const status = outcome.conflicts.length || outcome.failures.length ? "reconcile" : failedStages ? (applied || summaryStored ? "degraded" : "failed") : degraded ? "degraded" : applied || summaryStored || frozen ? "ok" : "noop";
     const ok = status === "ok" || status === "degraded" && failedStages === 0;
+    // §9 验收指标 / §10-4 断言口径：增量轮的实际送审行数（整理线快照 = 到期+陪绑
+    // 入窗；台账静默过滤数与增量开关无关，只在 dreamLedgerExtended 开时写）。
+    if (incrementalOn) outcome.input_count = snapshot.size;
+    if (ledgerOn) outcome.ledger_filtered_decisions = ledgerFilteredDecisions;
+    // 增量轮观测（WP3 §5 形状）：两线到期/冷却/沉底计数 + 陪绑 id 集合。
+    if (incrementalOn) outcome.incremental = {
+      enabled: true, fullReview: inc.fullReview,
+      due: { consolidation: inc.consolidation.due.size, sweep: inc.sweep.due.size },
+      not_due: { consolidation: inc.consolidation.notDue.size, sweep: inc.sweep.notDue.size },
+      sunk_now: { consolidation: inc.consolidation.sunk.size, sweep: inc.sweep.sunk.size },
+      neighbors: { consolidation: [...inc.consolidation.neighbors.keys()], sweep: [...inc.sweep.neighbors.keys()] }
+    };
     const receipt = buildReceipt({ runId, status, snapshotHash, inputCount: snapshot.size, applied, summaryStored });
     let baseline;
     if (ok) { const rows = eligible(service); baseline = { count: rows.length, chars: rows.reduce((n, m) => n + (m.title?.length ?? 0) + (m.content?.length ?? 0), 0) }; }
+    // §3.3 提交时机：阶梯提交 ⊂ 基线推进——只有 ok 轮才写 review_state（含沉底），
+    // 失败轮什么都不写，同一批条目下次点火仍然到期（隐式重试语义）。
+    // 兜底轮成功后刷新 last_full_review_at。写入失败只记日志，不影响本轮结果。
+    if (ok && incrementalOn) {
+      const rowById = new Map(initialEligible.map(m => [m.id, m]));
+      for (const [lane, agg] of [["consolidation", inc.consolidation], ["sweep", inc.sweep]]) {
+        const entries = [];
+        for (const [id, e] of agg.due) entries.push({ row: rowById.get(id) ?? e.row, prev: e.st, outcome: agg.hold.has(id) ? "hold" : "advance" });
+        for (const [id, e] of agg.sunk) entries.push({ row: rowById.get(id) ?? e.row, prev: e.st, outcome: "sink" });
+        // 陪绑行不计阶；本轮被提出过决定的陪绑行拉回「到期」（next_due_at=NULL）。
+        for (const [id, row] of agg.neighbors) if (agg.hold.has(id)) entries.push({ row: rowById.get(id) ?? row, prev: agg.states.get(id) ?? null, outcome: "hold" });
+        try { service.upsertReviewStates(lane, buildCommitRows(lane, entries, nowMs, runId)); } catch (error) { logger?.warn?.(`grouped dream review_state commit failed (${lane}): ${String(error)}`); }
+      }
+      if (inc.fullReview) { try { service.setReviewMeta("last_full_review_at", new Date(nowMs).toISOString()); } catch (error) { logger?.warn?.(`grouped dream review_meta failed: ${String(error)}`); } }
+    }
     try { service.saveDreamRun({ id: runId, created_at: started, status, error: failedStages ? `${failedStages} stage(s) failed` : undefined, provider: route?.provider, model: route?.model, input_count: snapshot.size, snapshot_hash: snapshotHash, input: [...snapshot.values()].map(evidence), decisions, outcome, skipped: [...outcome.groups.flatMap(g => g.skipped.map(s => ({ ...s, stage: g.types.join("+") }))), ...adjudicationSkipped], applied, summary_stored: summaryStored, receipt, policy_epoch: config.policyEpoch ?? 0, store_count: baseline?.count, store_chars: baseline?.chars }); } catch (error) { logger?.warn?.(`grouped dream audit failed: ${String(error)}`); }
     return { ok, status, runId, snapshotHash, receipt, applied, summary: summaryStored, narratives: 0, frozen, outcome, usage, baseline };
   };
@@ -107,17 +172,39 @@ export async function runGroupedDream(ctx, service, config, helpers) {
     if (text === undefined) throw new Error(streamFailure || "stream failed");
     return summary ? text : parseArray(text);
   };
+  const rowKeepHash = m => m?.content_hash ?? contentHashOf(m) ?? null;
+  // §4.3 ledgerSkip（开关开）：哈希匹配优先用严格哈希（无 strict_hash 的存量行
+  // 回退现行 content_hash 比较）。keep/applied（含永久护栏 keep）TTL 内 → 'resolved'
+  // 跳过送审；guard_rejected/invalid 冷却未到期 → 'cooling' 跳过送审。哈希失配 =
+  // 正文变了 → 重审；TTL 到期 → 重审；台账查询异常退化为「全量送审」（可用性优先）。
+  const ledgerSkip = (rec, ra, rb) => {
+    if (!rec) return null;
+    if (!(ra && rb && !ra.archived && !ra.forgotten && !rb.archived && !rb.forgotten)) return null;
+    const hashOk = rec.strict_hash_a
+      ? strictHashOf(ra) === rec.strict_hash_a && strictHashOf(rb) === rec.strict_hash_b
+      : Boolean(rec.hash_a && rec.hash_b && rowKeepHash(ra) === rec.hash_a && rowKeepHash(rb) === rec.hash_b);
+    if (!hashOk) return null;
+    if (rec.verdict === "keep" || rec.verdict === "applied") {
+      const decidedAt = Date.parse(rec.decided_at ?? "");
+      return Number.isFinite(decidedAt) && nowMs - decidedAt <= RESOLVED_KEEP_TTL_MS ? "resolved" : null;
+    }
+    const cooling = Date.parse(rec.cooldown_until ?? "");
+    return Number.isFinite(cooling) && cooling > nowMs ? "cooling" : null;
+  };
   for (const group of groups) {
     const audit = { types: group.types, input_ids: group.rows.map(m => m.id), input_count: group.rows.length, input_digest: hashSnapshot(group.rows), status: "skipped", skipped: [] };
     outcome.groups.push(audit);
-    if (!group.rows.length) continue;
+    if (!group.rows.length) { if (incrementalOn) audit.status = "skipped_not_due"; continue; }
     try {
       const raw = await call("dream_consolidate", group.types.join("+"), group.rows,
         STR.prompts.consolidation[language] + "\n" + STR.prompts.groupedGuard[language] + `\nnow=${new Date().toISOString()}; update <= ${config.reflectionUpdateMaxPerRun ?? 2}, archive <= ${config.dreamMaxArchivePerRun ?? 8}, merge <= ${config.dreamMaxMergePerRun ?? 40} decisions PER TYPE. Minimum update age ${config.reflectionUpdateMinAgeHours ?? 24} hours.`,
         group.rows.map(m => `id=${m.id} | type=${m.type} | importance=${m.importance} | updated=${m.updated_at} | created=${m.created_at} | scope=${JSON.stringify([m.agent_scope, m.workspace_scope])} | title=${m.title} | content=${m.content}`).join("\n"));
       const partitions = new Map(group.types.map(t => [t, []]));
       const localSnapshot = new Map(group.rows.map(m => [m.id, m]));
-      let reviewedCrossType = 0;
+      // 决定被台账静默过滤后，本组「显式覆盖」的只有被过滤的 id——隐式 keep 闸
+      // （dreamImplicitKeep）必须看见这些 id，否则会把合法过滤误判为残缺输出。
+      const ledgerFilteredIds = new Set();
+      let reviewedCrossType = 0, ledgerFilteredThisGroup = 0;
       for (const [index, d] of raw.entries()) {
         const ids = d?.action === "conflict" ? [d.winner, d.loser] : d?.ids;
         const rows = Array.isArray(ids) ? ids.map(id => localSnapshot.get(id)) : [];
@@ -127,16 +214,37 @@ export async function runGroupedDream(ctx, service, config, helpers) {
           degraded = true; reviewedCrossType++;
           continue;
         }
+        // §4.3 末条（dreamLedgerExtended，与增量开关无关）：整理线决定进入护栏
+        // 校验（partitions/validateDecisions）之前先按 pair_key（ids 排序拼 ':'，
+        // conflict 用 winner/loser；仅 ids.length≥2）查台账。命中 'resolved'
+        // （含永久护栏 keep）或 'cooling' → 静默丢弃：不进 audit.skipped、不置
+        // degraded，只计 outcome.ledger_filtered_decisions。n>2 的决定只在台账行
+        // 的 id_a/id_b 都在本组快照时判定；无法判定 = 不过滤。
+        if (ledgerOn && Array.isArray(ids) && ids.length >= 2 && rows.length === ids.length && rows.every(Boolean)) {
+          const unique = [...new Set(ids)].sort();
+          let rec;
+          try { rec = service.getConflictResolution?.(unique.join(":")); } catch { rec = undefined; }
+          if (rec) {
+            const skip = unique.length === 2
+              ? ledgerSkip(rec, localSnapshot.get(unique[0]), localSnapshot.get(unique[1]))
+              : ledgerSkip(rec, localSnapshot.get(rec.id_a), localSnapshot.get(rec.id_b));
+            if (skip === "resolved" || skip === "cooling") { ledgerFilteredDecisions++; ledgerFilteredThisGroup++; for (const id of unique) ledgerFilteredIds.add(id); continue; }
+          }
+        }
         if (!["keep", "merge", "archive", "update", "conflict"].includes(d?.action) || !rows.length || rows.some(m => !m) || types.size !== 1 || (d.action === "merge" && (new Set(ids).size < 2 || rows.some(m => !sameScope(rows[0], m)) || d.importance !== Math.max(...rows.map(m => m.importance))))) {
           audit.skipped.push({ index, action: d?.action, ids: Array.isArray(ids) ? ids : [], error: "invalid grouped schema, type, scope, or lossless merge importance" }); continue;
         }
         partitions.get(rows[0].type).push(d);
       }
       if (audit.skipped.length && config.dreamSkipInvalid === false) throw new Error("invalid grouped decisions in strict mode");
-      if (raw.length && !reviewedCrossType && ![...partitions.values()].some(p => p.length)) throw new Error("all grouped decisions invalid");
+      // 全部决定被台账静默过滤 ≠ 「全决定无效」：本组有过滤记录时不抛（§4.3 末条）。
+      if (raw.length && !reviewedCrossType && ![...partitions.values()].some(p => p.length) && ledgerFilteredThisGroup === 0) throw new Error("all grouped decisions invalid");
       if (audit.skipped.length) degraded = true;
       for (const [type, list] of partitions) {
         const typeSnapshot = new Map(group.rows.filter(m => m.type === type).map(m => [m.id, m]));
+        // 台账过滤掉的 id 注入隐式 keep（视同已审）：否则全部决定被过滤时覆盖率
+        // 闸会判「显式覆盖 0%」而置 degraded，违背「静默丢弃」语义（§4.3 末条）。
+        for (const id of ledgerFilteredIds) if (typeSnapshot.has(id) && !list.some(d => (d.action === "conflict" ? [d.winner, d.loser] : d.ids ?? []).includes(id))) list.push({ action: "keep", ids: [id], reason: "ledger_filtered" });
         const result = validateDecisions(list, typeSnapshot, { ...remaining(type), minAgeHours: config.reflectionUpdateMinAgeHours, dreamImplicitKeep: config.dreamImplicitKeep, dreamMinExplicitCoverage: config.dreamMinExplicitCoverage, skipInvalid: config.dreamSkipInvalid !== false, allowCrossTypeMerge: false, mergeGuard: config.dreamMergeGuard === true, allowedActions: ["keep", "merge", "archive", "update", "conflict"] });
         audit.skipped.push(...result.skipped);
         if (!result.ok) { failedStages++; audit.status = "failed"; audit.errors = [...(audit.errors ?? []), ...result.errors]; continue; }
@@ -162,10 +270,40 @@ export async function runGroupedDream(ctx, service, config, helpers) {
       if (audit.status !== "failed") audit.status = audit.skipped.length ? "degraded" : "ok";
     } catch (error) { failedStages++; audit.status = "failed"; audit.error = String(error); }
   }
+  // 整理线阶梯结果归纳（§3.3）：stage 失败 / 截断丢弃 / 被提出非 keep 决定
+  // （invalid、护栏拒、已应用都算；台账过滤掉的永久护栏决定到不了这里）→ hold；
+  // 入窗且清白 → advance（默认）。陪绑行被提出决定 → 拉回到期（hold）。
+  if (incrementalOn) {
+    const mark = ids => { for (const id of ids ?? []) if (inc.consolidation.due.has(id) || inc.consolidation.neighbors.has(id)) inc.consolidation.hold.add(id); };
+    for (const audit of outcome.groups) {
+      if (audit.status === "failed") for (const id of audit.input_ids) if (inc.consolidation.due.has(id)) inc.consolidation.hold.add(id);
+      for (const s of audit.skipped) mark(s?.ids);
+    }
+    for (const d of decisions) if (d?.action !== "keep") mark(d.action === "conflict" || d.action === "supersede" ? [d.winner, d.loser] : d.ids);
+    for (const c of outcome.cross_type_candidates) mark(c.evidence?.map(m => m.id));
+    for (const id of consTruncatedDropped) inc.consolidation.hold.add(id);
+  }
   // Sweep takes a fresh eligible snapshot AFTER consolidation, never stale archived ids.
-  const sweepRows = eligible(service), sweep = sweepWindows(sweepRows);
+  const sweepRows = eligible(service);
+  // 增量模式（§5.2/§8）：切带/cap 作用在「到期 + 陪绑」集合上；sweepSnapshot 与
+  // 裁决台账仍用全量 eligible（裁决与台账要能查到所有行）。非增量 = 现状逐字节。
+  let sweepWindowRows = sweepRows;
+  if (incrementalOn) {
+    const sweepStates = service.getReviewStates("sweep");
+    inc.sweep.states = sweepStates;
+    const swSel = selectDue("sweep", sweepRows, sweepStates, nowMs, inc.fullReview);
+    for (const e of swSel.due) inc.sweep.due.set(e.row.id, e);
+    for (const e of swSel.sunk) inc.sweep.sunk.set(e.row.id, e);
+    for (const e of swSel.notDue) inc.sweep.notDue.set(e.row.id, e);
+    // 扫描线陪绑：全类型、k=NeighborK+2、全局上限 150（§5.1）。
+    const swPool = [...swSel.notDue, ...swSel.sunk].map(e => e.row);
+    for (const m of pickNeighbors({ seeds: swSel.due.filter(e => e.seed).map(e => e.row), pool: swPool, corpus: sweepRows, k: neighborK + 2, cap: SWEEP_NEIGHBOR_CAP }))
+      inc.sweep.neighbors.set(m.id, m);
+    sweepWindowRows = [...sweepRows.filter(m => inc.sweep.due.has(m.id)), ...inc.sweep.neighbors.values()];
+  }
+  const sweep = sweepWindows(sweepWindowRows);
   const sweepSnapshot = new Map(sweepRows.map(m => [m.id, m]));
-  outcome.sweep = { status: "ok", total: sweep.total, covered_unique: sweep.covered, dropped: sweep.dropped, input_digest: hashSnapshot(sweepRows), truncated: sweep.dropped > 0, coverage_note: "Pair co-presence covers the selected subsets, not guaranteed semantic recall; omitted rows have no coverage.", segments: sweep.segments.map(({ rows, ...s }) => s), stages: [], candidates: [] };
+  outcome.sweep = { status: "ok", total: sweep.total, covered_unique: sweep.covered, dropped: sweep.dropped, input_digest: hashSnapshot(sweepWindowRows), truncated: sweep.dropped > 0, coverage_note: "Pair co-presence covers the selected subsets, not guaranteed semantic recall; omitted rows have no coverage.", segments: sweep.segments.map(({ rows, ...s }) => s), stages: [], candidates: [] };
   const candidates = new Map();
   for (const window of sweep.windows) {
     const stage = { label: window.label, input_ids: window.rows.map(m => m.id), input_count: window.rows.length, input_digest: hashSnapshot(window.rows), status: "ok", rejected: [] };
@@ -196,25 +334,7 @@ export async function runGroupedDream(ctx, service, config, helpers) {
   // （explicit_keep_not_resolution 降级噪音就此剔除）、不算 stage 失败；
   // failedStages/degraded/status/基线推进语义零改动。哈希失配或 TTL 到期照常
   // 送审，写端审后 upsert 覆盖旧行。台账查询异常退化为「全量送审」——可用性优先。
-  const rowKeepHash = m => m?.content_hash ?? contentHashOf(m) ?? null;
-  // §4.3 ledgerSkip（开关开）：哈希匹配优先用严格哈希（无 strict_hash 的存量行
-  // 回退现行 content_hash 比较）。keep/applied（含永久护栏 keep）TTL 内 → 'resolved'
-  // 跳过送审；guard_rejected/invalid 冷却未到期 → 'cooling' 跳过送审。哈希失配 =
-  // 正文变了 → 重审；TTL 到期 → 重审；台账查询异常退化为「全量送审」（可用性优先）。
-  const ledgerSkip = (rec, ra, rb) => {
-    if (!rec) return null;
-    if (!(ra && rb && !ra.archived && !ra.forgotten && !rb.archived && !rb.forgotten)) return null;
-    const hashOk = rec.strict_hash_a
-      ? strictHashOf(ra) === rec.strict_hash_a && strictHashOf(rb) === rec.strict_hash_b
-      : Boolean(rec.hash_a && rec.hash_b && rowKeepHash(ra) === rec.hash_a && rowKeepHash(rb) === rec.hash_b);
-    if (!hashOk) return null;
-    if (rec.verdict === "keep" || rec.verdict === "applied") {
-      const decidedAt = Date.parse(rec.decided_at ?? "");
-      return Number.isFinite(decidedAt) && nowMs - decidedAt <= RESOLVED_KEEP_TTL_MS ? "resolved" : null;
-    }
-    const cooling = Date.parse(rec.cooldown_until ?? "");
-    return Number.isFinite(cooling) && cooling > nowMs ? "cooling" : null;
-  };
+  // （rowKeepHash / ledgerSkip 已上移到整理线循环之前，供 §4.3 决定过滤复用。）
   const toAdjudicate = [];
   let resolvedKeepSkipped = 0, ledgerCoolingSkipped = 0;
   for (const [key, c] of candidates) {
@@ -239,6 +359,30 @@ export async function runGroupedDream(ctx, service, config, helpers) {
   // 冷却跳过是台账预期收益，不是降级噪音：不进裁决、不进 adjudicationSkipped、不置 degraded。
   if (ledgerOn) outcome.sweep.ledger_cooling_skipped = ledgerCoolingSkipped;
   outcome.sweep.candidates = [...candidates.values()];
+  // 扫描线阶梯结果归纳（§3.3）：stage 失败 / 带 cap 丢弃 / 裁决对成员（除显式
+  // keep 落账与台账 resolved_keep）→ hold；入窗且不在任何候选对 → advance（默认）。
+  // 陪绑行不计阶，被提出过决定的陪绑行拉回到期（hold）。
+  if (incrementalOn) {
+    for (const stage of outcome.sweep.stages) {
+      // stage 失败 → 窗内到期行全体 hold；被 stage 拒掉的候选对（cap/invalid）
+      // 也是「被提出过」→ 两端 hold。
+      if (stage.status === "failed") for (const id of stage.input_ids) if (inc.sweep.due.has(id)) inc.sweep.hold.add(id);
+      for (const item of stage.rejected) for (const id of item.ids ?? []) {
+        if (inc.sweep.due.has(id)) inc.sweep.hold.add(id);
+        else if (inc.sweep.neighbors.has(id)) inc.sweep.hold.add(id);
+      }
+    }
+    for (const seg of outcome.sweep.segments) for (const id of seg.dropped_ids ?? []) if (inc.sweep.due.has(id)) inc.sweep.hold.add(id);
+    for (const c of candidates.values()) {
+      if (c.status === "resolved_keep") continue;
+      const explicitKeep = Boolean(c.decisions?.some(l => l.verdict?.action === "keep"));
+      const proposed = Boolean(c.decisions?.length || c.rejections?.length);
+      for (const id of [c.a, c.b]) {
+        if (inc.sweep.due.has(id)) { if (!explicitKeep) inc.sweep.hold.add(id); }
+        else if (inc.sweep.neighbors.has(id) && proposed) inc.sweep.hold.add(id);
+      }
+    }
+  }
   const receiptSnapshot = new Map(snapshot);
   const adjudication = await adjudicateCandidates({ candidates:toAdjudicate, service, config, call, claims, remaining, account, runId, logger, evidence, sameScope, snapshot:receiptSnapshot, route, now: nowMs, wrapBody: body => fenceListBody(language, body, "json") });
   outcome.adjudication=adjudication.audit; adjudicationSkipped.push(...adjudication.skipped);

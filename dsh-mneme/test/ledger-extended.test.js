@@ -241,3 +241,62 @@ test('ledger cooling skip requires hash match; content change re-adjudicates', a
   assert.ok(f.calls.slice(callsAfter1).some(c => c.messages[0].content[0].text.startsWith('Full-body')));
  } finally { f.store.close(); }
 });
+
+// ── WP3 追加（§4.3 末条）：整理线决定在进护栏校验之前先过台账 ──────────────
+// pair_key = 决定 ids 排序拼 ':'（conflict 用 winner/loser，仅 ids≥2）。命中
+// 'resolved'（keep/applied/永久护栏，TTL 内）或 'cooling' → 静默丢弃：不进
+// audit.skipped、不置 degraded、不产生应用，只计 outcome.ledger_filtered_decisions。
+function packLedgerFixture(n, extra, handler) {
+ return fixture(n, { dreamLedgerExtended: true, ...extra }, handler);
+}
+const projectPair = f => { const p = f.service.all().filter(m => m.type === 'project').map(m => m.id).sort(); return p; };
+
+test('§4.3 consolidation decisions hitting the ledger are silently dropped', async () => {
+ const projectsOf = f => f.service.all().filter(m => m.type === 'project').map(m => m.id).sort();
+ const f = packLedgerFixture(21, {}, ({ system, body, text }) => {
+  if (body.includes('| type=') && !system.includes('UUID/type/updated/title') && body.includes('type=project')) {
+   const [a, b, c] = projectsOf(f);
+   return JSON.stringify([
+    { action: 'archive', ids: [a, b], reason: 'outdated whole entry' },
+    { action: 'archive', ids: [a, c], reason: 'outdated whole entry' }
+   ]);
+  }
+  return text;
+ });
+ try {
+  aged(f);
+  const [a, b, c] = projectsOf(f);
+  const all = new Map(f.service.all().map(m => [m.id, m]));
+  // 第一对：台账 keep（严格哈希匹配、TTL 内）→ resolved；第二对：guard_rejected 冷却中 → cooling。
+  f.service.upsertConflictResolution({ pair_key: `${a}:${b}`, id_a: a, id_b: b, verdict: 'keep', strict_hash_a: strictHashOf(all.get(a)), strict_hash_b: strictHashOf(all.get(b)) });
+  f.service.upsertConflictResolution({ pair_key: `${a}:${c}`, id_a: a, id_b: c, verdict: 'guard_rejected', fail_reason: 'too_young', strict_hash_a: strictHashOf(all.get(a)), strict_hash_b: strictHashOf(all.get(c)), cooldown_until: new Date(f.FIXED + DAY).toISOString() });
+  const r = await f.run();
+  assert.equal(r.applied, 0, 'filtered decisions never reach the apply path');
+  assert.equal(r.outcome.ledger_filtered_decisions, 2);
+  const pack = r.outcome.groups.find(g => g.types.includes('project'));
+  assert.deepEqual(pack.skipped, [], '静默丢弃：不进 audit.skipped');
+  assert.equal(pack.status, 'ok', '过滤后的组不置 degraded/failed');
+  assert.ok(!r.outcome.degradations.some(d => d.kind === 'consolidation_truncated'));
+  assert.ok([a, b, c].every(id => !f.service.getById(id).archived));
+ } finally { f.store.close(); }
+});
+
+test('§4.3 ledger filter is hash-strict: a changed body re-admits the decision', async () => {
+ const f = packLedgerFixture(14, {}, ({ system, body, text }) => {
+  if (body.includes('| type=') && !system.includes('UUID/type/updated/title') && body.includes('type=project')) {
+   const [a, b] = projectPair(f);
+   return JSON.stringify([{ action: 'archive', ids: [a, b], reason: 'outdated whole entry' }]);
+  }
+  return text;
+ });
+ try {
+  aged(f);
+  const [a, b] = projectPair(f);
+  const all = new Map(f.service.all().map(m => [m.id, m]));
+  f.service.upsertConflictResolution({ pair_key: `${a}:${b}`, id_a: a, id_b: b, verdict: 'keep', strict_hash_a: strictHashOf(all.get(a)), strict_hash_b: 'stale-hash' });
+  const r = await f.run();
+  assert.equal(r.outcome.ledger_filtered_decisions, 0, '严格哈希失配 → 不过滤');
+  assert.equal(r.applied, 2, '决定照常进护栏并应用');
+  assert.ok(f.service.getById(a).archived && f.service.getById(b).archived);
+ } finally { f.store.close(); }
+});
