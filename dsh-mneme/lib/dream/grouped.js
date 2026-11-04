@@ -4,7 +4,7 @@ import { validateDecisions, applyDecisions } from "./decisions.js";
 import { isImportedRow } from "../memory-source.js";
 import { scopeKeyOf } from "../scope.js";
 import { adjudicateCandidates } from "./adjudication.js";
-import { contentHashOf } from "../content-hash.js";
+import { contentHashOf, strictHashOf } from "../content-hash.js";
 import { STR, langOf } from "../lang.js";
 
 // 出口1（resolved_keep 台账）读取端 TTL：超过 30 天的 keep 结论重新送审
@@ -58,6 +58,9 @@ const evidence = m => Object.fromEntries(["id", "type", "title", "content", "imp
 export async function runGroupedDream(ctx, service, config, helpers) {
   const { semantic, resolveRoute, resolveDreamEffort, runAuditedLlm, streamText, withMaxTokensFallback, describeStreamFailure, fenceListBody, hashSnapshot, buildReceipt, buildOutcome, buildRecordReceipts, maintainIndexAfterDream, reEmbedMemory } = helpers;
   const language = langOf(config), logger = ctx.logger;
+  // 统一注入时刻（毫秒）：调度器可注入 helpers.now；台账冷却/TTL 判定都以此为准。
+  const nowMs = typeof helpers.now === "function" ? helpers.now() : Date.now();
+  const ledgerOn = config.dreamLedgerExtended === true;
   const started = new Date().toISOString(), runId = randomUUID(), route = resolveRoute(ctx, config, logger);
   const initialEligible = eligible(service);
   const groups = consolidationGroups(initialEligible, Number.isInteger(config.dreamGroupedWindow) ? Math.max(1, Math.min(CONSOLIDATION_GROUP_CAP, config.dreamGroupedWindow)) : CONSOLIDATION_GROUP_CAP);
@@ -88,15 +91,15 @@ export async function runGroupedDream(ctx, service, config, helpers) {
   const effort = config.dreamReasoningEffort && config.dreamReasoningEffort !== "none"
     ? config.dreamReasoningEffort
     : await resolveDreamEffort(ctx, route, config.dreamReasoningEffort, logger);
-  const call = async (operationType, label, rows, prompt, body, summary = false) => {
+  const call = async (operationType, label, rows, prompt, body, summary = false, effortOverride = undefined) => {
     let streamFailure = "";
     const selectedRoute = summary && config.dreamSummaryProvider && config.dreamSummaryModel ? { provider: config.dreamSummaryProvider, model: config.dreamSummaryModel } : route;
     const run = tokens => runAuditedLlm(ctx, service, config, {
       triggerSource: "autoDream", operationType, modelId: `${selectedRoute.provider}:${selectedRoute.model}`,
       relatedMemoryIds: rows.map(m => m.id), streamError: () => streamFailure,
       auditError: text => { if (summary) return null; try { parseArray(text); return null; } catch { return "no JSON array"; } },
-      metadataFrom: () => ({ mode: "grouped", stage: label, input_count: rows.length, reasoning_effort: operationType === "dream_adjudicate" ? "low" : effort, provider: selectedRoute.provider, model: selectedRoute.model })
-    }, reportUsage => streamText(ctx, { ...selectedRoute, purpose: "compaction", maxTokens: tokens, ...(operationType === "dream_adjudicate" ? {reasoningEffort:"low"} : effort ? { reasoningEffort: effort } : {}), messages: [
+      metadataFrom: () => ({ mode: "grouped", stage: label, input_count: rows.length, reasoning_effort: operationType === "dream_adjudicate" ? effortOverride ?? "low" : effort, provider: selectedRoute.provider, model: selectedRoute.model })
+    }, reportUsage => streamText(ctx, { ...selectedRoute, purpose: "compaction", maxTokens: tokens, ...(operationType === "dream_adjudicate" ? {reasoningEffort:effortOverride ?? "low"} : effort ? { reasoningEffort: effort } : {}), messages: [
       { role: "system", content: [{ type: "text", text: prompt }], source: { kind: "plugin:dsh-mneme", plugin: "dsh-mneme" } },
       { role: "user", content: [{ type: "text", text: fenceListBody(language, body, summary ? "text" : "json") }], source: { kind: "plugin:dsh-mneme", plugin: "dsh-mneme" } }
     ] }, u => { usage.push({ stage: label, ...u }); reportUsage(u); }, reason => { streamFailure = describeStreamFailure(reason); }));
@@ -194,12 +197,37 @@ export async function runGroupedDream(ctx, service, config, helpers) {
   // failedStages/degraded/status/基线推进语义零改动。哈希失配或 TTL 到期照常
   // 送审，写端审后 upsert 覆盖旧行。台账查询异常退化为「全量送审」——可用性优先。
   const rowKeepHash = m => m?.content_hash ?? contentHashOf(m) ?? null;
+  // §4.3 ledgerSkip（开关开）：哈希匹配优先用严格哈希（无 strict_hash 的存量行
+  // 回退现行 content_hash 比较）。keep/applied（含永久护栏 keep）TTL 内 → 'resolved'
+  // 跳过送审；guard_rejected/invalid 冷却未到期 → 'cooling' 跳过送审。哈希失配 =
+  // 正文变了 → 重审；TTL 到期 → 重审；台账查询异常退化为「全量送审」（可用性优先）。
+  const ledgerSkip = (rec, ra, rb) => {
+    if (!rec) return null;
+    if (!(ra && rb && !ra.archived && !ra.forgotten && !rb.archived && !rb.forgotten)) return null;
+    const hashOk = rec.strict_hash_a
+      ? strictHashOf(ra) === rec.strict_hash_a && strictHashOf(rb) === rec.strict_hash_b
+      : Boolean(rec.hash_a && rec.hash_b && rowKeepHash(ra) === rec.hash_a && rowKeepHash(rb) === rec.hash_b);
+    if (!hashOk) return null;
+    if (rec.verdict === "keep" || rec.verdict === "applied") {
+      const decidedAt = Date.parse(rec.decided_at ?? "");
+      return Number.isFinite(decidedAt) && nowMs - decidedAt <= RESOLVED_KEEP_TTL_MS ? "resolved" : null;
+    }
+    const cooling = Date.parse(rec.cooldown_until ?? "");
+    return Number.isFinite(cooling) && cooling > nowMs ? "cooling" : null;
+  };
   const toAdjudicate = [];
-  let resolvedKeepSkipped = 0;
+  let resolvedKeepSkipped = 0, ledgerCoolingSkipped = 0;
   for (const [key, c] of candidates) {
     let rec;
     try { rec = service.getConflictResolution?.(key); } catch { rec = undefined; }
     const ra = sweepSnapshot.get(c.a), rb = sweepSnapshot.get(c.b);
+    if (ledgerOn) {
+      const skip = ledgerSkip(rec, ra, rb);
+      if (skip === "resolved") { c.status = "resolved_keep"; c.transitions.push("resolved_keep"); resolvedKeepSkipped++; continue; }
+      if (skip === "cooling") { c.status = "ledger_cooling"; c.transitions.push("ledger_cooling"); ledgerCoolingSkipped++; continue; }
+      toAdjudicate.push(c);
+      continue;
+    }
     const active = Boolean(ra && rb && !ra.archived && !ra.forgotten && !rb.archived && !rb.forgotten);
     const hashOk = Boolean(active && rec && rec.hash_a && rec.hash_b && rowKeepHash(ra) === rec.hash_a && rowKeepHash(rb) === rec.hash_b);
     const decidedAt = rec ? Date.parse(rec.decided_at ?? "") : NaN;
@@ -208,9 +236,11 @@ export async function runGroupedDream(ctx, service, config, helpers) {
     toAdjudicate.push(c);
   }
   outcome.sweep.resolved_keep_skipped = resolvedKeepSkipped;
+  // 冷却跳过是台账预期收益，不是降级噪音：不进裁决、不进 adjudicationSkipped、不置 degraded。
+  if (ledgerOn) outcome.sweep.ledger_cooling_skipped = ledgerCoolingSkipped;
   outcome.sweep.candidates = [...candidates.values()];
   const receiptSnapshot = new Map(snapshot);
-  const adjudication = await adjudicateCandidates({ candidates:toAdjudicate, service, config, call, claims, remaining, account, runId, logger, evidence, sameScope, snapshot:receiptSnapshot, route, wrapBody: body => fenceListBody(language, body, "json") });
+  const adjudication = await adjudicateCandidates({ candidates:toAdjudicate, service, config, call, claims, remaining, account, runId, logger, evidence, sameScope, snapshot:receiptSnapshot, route, now: nowMs, wrapBody: body => fenceListBody(language, body, "json") });
   outcome.adjudication=adjudication.audit; adjudicationSkipped.push(...adjudication.skipped);
   decisions.push(...adjudication.decisions); committed.push(...adjudication.committed); applied+=adjudication.applied; frozen+=adjudication.frozen;
   Object.assign(outcome.byId,buildOutcome(adjudication.committed).byId);

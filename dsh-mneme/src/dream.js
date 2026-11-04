@@ -1071,7 +1071,7 @@ export function createDreamScheduler({ onRun, thresholdCount = 10, thresholdChar
     if (config.dreamConsolidationMode === "grouped") return runGroupedDream(ctx, service, config, {
       semantic, resolveRoute, resolveDreamEffort, runAuditedLlm, streamText,
       withMaxTokensFallback, describeStreamFailure, fenceListBody, hashSnapshot,
-      buildReceipt, buildOutcome, buildRecordReceipts, maintainIndexAfterDream, reEmbedMemory
+      buildReceipt, buildOutcome, buildRecordReceipts, maintainIndexAfterDream, reEmbedMemory, now
     });
     const language = langOf(config);
     const logger = ctx.logger;

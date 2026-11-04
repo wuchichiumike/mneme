@@ -260,6 +260,8 @@ export const Config = z.object({
   // Opt-in only: grouped uses this window independently for each category pack.
   dreamConsolidationMode: z.union([z.const("legacy"), z.const("grouped")]).default("legacy"),
   dreamGroupedWindow: z.natural().min(1).max(500).default(500),
+  // 台账四态 + 白卷批级重试（consolidation 设计文档 §4/§7）。关 = 现行行为逐字节不变。
+  dreamLedgerExtended: z.boolean().default(false),
   // Issue #104 方向 2：单轮 archive 决策上限。一次性大扫除（12 条互不相关主题
   // 被批量归档，其中 8 条疑似误伤长保留类型）是失控信号，与 update 上限同类的
   // 全局闸门：skipInvalid 也不豁免，超限整单拒绝。正常清理可调高。
