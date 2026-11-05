@@ -76,6 +76,23 @@ const MEMORY_PROVENANCE = (m) => {
   return parts.length ? ` | ${parts.join(" | ")}` : "";
 };
 
+// 本地补丁（只读工作区）：会改动记忆库内容的工具调用。memory_organize 只有
+// mode=apply 才落库（dryRun 只写审计回执）；memory_runtime 管本地推理依赖，与
+// 记忆内容无关；search/list/get 只读（命中统计属于检索副作用，不产生新记忆）。
+const WRITE_TOOLS = new Set([
+  "memory_save",
+  "memory_update",
+  "memory_delete",
+  "memory_forget",
+  "memory_archive",
+  "memory_register_document"
+]);
+export function isWriteToolCall(name, args) {
+  if (WRITE_TOOLS.has(name)) return true;
+  if (name === "memory_organize") return String(args?.mode ?? "dryRun").trim() === "apply";
+  return false;
+}
+
 export function createTools(ctx, service, config, embedder, sessionGate = null) {
   const toolsRegistry = ctx.tools;
   let registration = REGISTERED_TOOLS.get(toolsRegistry);
@@ -1059,8 +1076,14 @@ export function createTools(ctx, service, config, embedder, sessionGate = null) 
       if (typeof tool.execute === "function") {
         const execute = tool.execute.bind(tool);
         tool.execute = async (args, exec) => {
-          if (registration.sessionGate?.isOff(sessionOf(exec))) {
+          const session = sessionOf(exec);
+          if (registration.sessionGate?.isOff(session)) {
             throw new Error("dsh-mneme: memory tools are disabled for this incognito session");
+          }
+          if (isWriteToolCall(tool.name, args) && registration.sessionGate?.isWriteOff?.(session)) {
+            throw new Error(
+              `dsh-mneme: ${tool.name} is disabled in this read-only workspace — memories can be searched and read here, but not created or changed`
+            );
           }
           return execute(args, exec);
         };

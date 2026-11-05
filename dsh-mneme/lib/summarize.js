@@ -670,7 +670,8 @@ export function createSummarizer(ctx, service, config, deps = {}, sessionGate = 
 
   async function summarize(session, triggerEvent, opts = {}) {
     if (disposed || inFlight.has(session.id)) return;
-    if (sessionGate?.isOff(session)) return;
+    // 只读工作区（isWriteOff ⊇ isOff）同样不蒸馏：蒸馏是会话 → 新记忆的主通道。
+    if (sessionGate?.isWriteOff?.(session) ?? sessionGate?.isOff(session)) return;
 
     const header = session.requestHeader?.()?.config;
     // Config override takes priority, then session header, then nothing.

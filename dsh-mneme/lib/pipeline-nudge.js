@@ -537,7 +537,7 @@ export function toolCallsInLine(line) {
  * 或「同一个项目」。
  */
 export function readSessionObservations({ sessionDir = resolveSessionDir(), limit = MAX_SESSION_FILES, deadline = null, sessionGate = null } = {}) {
-  const filterSessions = sessionGate?.isEnabled?.() === true;
+  const filterSessions = (sessionGate?.needsFiltering?.() ?? sessionGate?.isEnabled?.()) === true;
   const found = findSessionFiles(sessionDir, { limit });
   const files = found.files.slice(0, limit);
   const totalFiles = Number.isFinite(found.totalFiles) ? found.totalFiles : found.files.length;
@@ -572,7 +572,7 @@ export function readSessionObservations({ sessionDir = resolveSessionDir(), limi
     const parts = file.split(/[\\/]/);
     const sessionId = parts.slice(-2, -1)[0] || null;
     const bucket = parts.slice(-3, -2)[0] || null;
-    if (filterSessions && sessionGate.isOff(sessionId)) continue;
+    if (filterSessions && (sessionGate.isWriteOff?.(sessionId) ?? sessionGate.isOff(sessionId))) continue;
     let buf;
     try {
       buf = readFileSync(file);
@@ -592,7 +592,7 @@ export function readSessionObservations({ sessionDir = resolveSessionDir(), limi
             try {
               const row = JSON.parse(line);
               const header = row?.header ?? row?.config ?? row?.data?.header ?? row?.data?.config ?? row?.data ?? row;
-              if (sessionGate.isOff({ id: sessionId, header })) {
+              if (sessionGate.isWriteOff?.({ id: sessionId, header }) ?? sessionGate.isOff({ id: sessionId, header })) {
                 excluded = true;
                 break;
               }

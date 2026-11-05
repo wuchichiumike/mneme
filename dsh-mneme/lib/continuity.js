@@ -218,7 +218,10 @@ export function createContinuityRescue(ctx, store, sessionGate = null) {
     const fields = deriveContinuity(session);
     // 落库先于注入：提案是"脱离对话独立存活"的那一半。写不进去不算宿主这一步的失败——
     // 可选插件的可选能力把 agent 的一步带崩，比丢一次抢救严重得多（本函数的不变量）。
-    try {
+    // 只读工作区：提案是候选记忆，不落库；会话内的续接提示照常注入（它只把本会话
+    // 自己的状态还给本会话，不写任何东西）。
+    const writeOff = sessionGate?.isWriteOff?.(session) === true;
+    if (!writeOff) try {
       const saved = store.saveContinuityProposal({
         sessionId,
         kind: CONTINUITY_KIND,

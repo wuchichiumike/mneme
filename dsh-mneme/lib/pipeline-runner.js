@@ -111,7 +111,7 @@ export function createExecutionRecorder({
   // 已结账、等人确认的会话：sessionId → { pipeline, projectRoot, proposal, stats }
   const pending = new Map();
   const gated = (session) => {
-    if (!sessionGate?.isOff(session)) return false;
+    if (!(sessionGate?.isWriteOff?.(session) ?? sessionGate?.isOff(session))) return false;
     const id = session?.id;
     if (id) {
       windows.delete(id);

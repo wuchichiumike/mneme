@@ -990,7 +990,12 @@ export const Config = z.object({
   // 未开时不生效。手动名单是精确的 session id 匹配。
   sessionGateEnabled: z.boolean().default(false),
   sessionGateSubagents: z.boolean().default(true),
-  sessionGateSessions: z.array(z.string()).default([])
+  sessionGateSessions: z.array(z.string()).default([]),
+  // 本地补丁：只读工作区。会话 cwd 等于或位于名单内任一目录（`~` 展开、realpath
+  // 归一、按路径段前缀匹配）→ 不产生、不写入新记忆（蒸馏 / 续接提案 / 流水线观测
+  // 关闭，写类记忆工具拒绝），但记忆注入与只读检索照常。不受 sessionGateEnabled
+  // 约束：默认空 = 零行为变化。
+  sessionGateReadOnlyWorkspaces: z.array(z.string()).default([])
 });
 
 // Fields forced to false by the light-mode preset. Everything not listed here

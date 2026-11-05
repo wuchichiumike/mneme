@@ -102,7 +102,7 @@ export function createNudgeAutoRun({
 
   const onSessionEvent = (session, event) => {
     if (disposed) return;
-    if (sessionGate?.isOff(session)) return;
+    if (sessionGate?.isWriteOff?.(session) ?? sessionGate?.isOff(session)) return;
     // 只认 turn/end：一轮结束才算一个观测窗口，中途记的是半截。
     if (!event || event.type !== "turn/end") return;
     const projectRoot = projectRootOf(session);
