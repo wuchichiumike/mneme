@@ -17,6 +17,110 @@
 
 <p align="center">🌏 <a href="#中文">简体中文</a> · <a href="#english">English</a></p>
 
+> [!IMPORTANT]
+> **这是 `fork/0.9.5-local` 分支，不是上游正式版本。**
+> 基线是上游 [`v0.9.5`](https://github.com/slow-stack/mneme/tree/v0.9.5)（与 npm `@modusensus/dsh-mneme@0.9.5` 逐字节一致），在其上叠加了下面列出的本地改动，改动只在 `dsh-mneme/{src,lib,test,docs}/`。上游 `main` 已经到 v0.11.0；除第 1 项（已在上游 v0.10.0 以更完整的形式发布）外，这里的改动上游都没有。
+> 原版 README 从[分隔线](#upstream-readme)以下开始，内容没有改动。
+
+## 与上游 v0.9.5 的差异
+
+| # | 提交 | 改动 | 上游状态 | 默认 |
+|---|---|---|---|---|
+| 1 | `backport(session)` | #539 逐会话无痕闸门 | 已合入 v0.10.0（[#540](https://github.com/slow-stack/mneme/pull/540) + [#541](https://github.com/slow-stack/mneme/pull/541)） | 关 |
+| 2 | `feat(dream)` | 分组巩固 + 跨类型扫描 + 全文裁决 + 冲突台账 | 无 | 关 |
+| 3 | `WP1`–`WP4` | 增量送审、台账四态、365 天确定性归档 | 无 | 关 |
+| 4 | `WP5` | 只读工作区：可注入、不写新记忆 | 无 | 关 |
+
+所有新配置项的默认值都保持原有行为，不改配置时与 0.9.5 一致。
+
+### 1. #539 逐会话无痕闸门（回移）
+
+取自 [#540](https://github.com/slow-stack/mneme/pull/540) 的原始提交 `8ac5be4`，**只取了 `lib/`**。
+
+- 配置：`sessionGateEnabled`（总开关，默认关）、`sessionGateSubagents`（默认开）、`sessionGateSessions`（手动 session id 名单）。
+- 命中的会话：记忆注入、蒸馏、记忆工具、流水线观测、压缩续接全部关闭。
+
+**已知问题。** 本分支**没有**带上 [#541](https://github.com/slow-stack/mneme/pull/541) 的评审修复，因此：
+
+- `isChild` 只要看到 `parentSession` 就判为子代理。`sessions.fork()` 分出的主会话也带这个字段，开闸后会被当成子代理，整体失去记忆。
+- `src/` 没有同步，`test/lib-smoke.test.js` 的「src/ 与 lib/ 逐字节一致」断言会失败。
+
+需要这个功能时，建议直接用上游 v0.10.0 及以后的版本。
+
+### 2. 分组巩固（`dreamConsolidationMode: grouped`）
+
+把 dream 的单一滑动窗口巩固换成三段，代码在 `src/dream/grouped.js` 和 `src/dream/adjudication.js`：
+
+- **按类型分包巩固**：分成 `project+history`、`decision+constraint`、`pitfall+preference+rejected_solution` 三包，每包独立取窗口（`dreamGroupedWindow`，上限 500）。超出窗口时记 `consolidation_truncated`。巩固决定不得跨类型，`lang.js` 里另有一段 grouped 专用的语义护栏提示词。
+- **跨类型扫描**：只看元数据（UUID、type、updated、title），不看正文。条目按时间分成 A/B/C 三段，每段最多 500 条，在 AC、AB、CB 三个窗口里各提出最多 5 对候选。
+- **全文裁决**：所有候选对合并成一次有界调用（最多 15 对，提示词不超过 96 KiB），读取正文后给出决定，再交给原生决策引擎落库。
+- **冲突台账**：新表 `conflict_resolutions` 记录已裁决的对，包括 `pair_key`、双方内容哈希和 30 天 TTL。已判 keep 的对在 TTL 内不再重复送审。
+
+配置：`dreamConsolidationMode`（`legacy` | `grouped`，默认 `legacy`）、`dreamGroupedWindow`（1–500，默认 500）。
+
+### 3. 增量送审、台账四态、确定性归档（WP1–WP4，仅 grouped 模式）
+
+目的：降低每次 dream 的输入量。改造前每次点火都把约 1300 条全文送进巩固和扫描。
+
+- **WP1 存储层**
+  - 新增侧表 `review_state`（主键 `memory_id + lane`）和 `review_meta`。不在 `memories` 上加列，因为改这张表会刷新 `updated_at`。
+  - 新增 `strictHashOf = sha256(title \0 content)`，不做归一化。原 `contentHashOf` 会把 `3.5` 和 `35` 视为相同。
+  - 新增两条复审阶梯的纯函数：整理线 1/4/12/24h，扫描线 1/4/8/12/12/12/12h，走完后沉底，每条带确定性抖动。
+- **WP2 台账四态**（`dreamLedgerExtended`）
+  - `conflict_resolutions` 的裁决扩展为 keep / applied / guard_rejected / invalid 四态，并加冷却时间、失败计数和待人工标记。
+  - 被永久护栏拦下（跨 scope、跨类型 merge、长保留类型归档）记为 `guard_rejected`。被临时护栏拦下的进 24 小时冷却。同一原因连续 3 次后标记待人工，冷却 7 天。
+  - 裁决批次返回空白结果时，用 `medium` 推理强度重发一次。仍为空则整批记 `invalid`，冷却 24 小时。
+  - 整理线的决定也经过台账过滤。
+- **WP3 增量送审**（`dreamIncrementalReview`）
+  - 两条线各自只送「到期」的条目：新条目、哈希变了的条目，以及阶梯到期的条目。
+  - 每个到期条目用 BM25 带上邻居一起送审：整理线每条 k 个、每组最多 60 条，扫描线每条 k+2 个、最多 150 条。
+  - 每隔 N 天做一次全量兜底。只有本轮成功才提交 `review_state`。
+  - 配置：`dreamIncrementalNeighborK`（1–20，默认 3）、`dreamIncrementalFullReviewDays`（1–90，默认 7）。
+- **WP4 确定性归档**（`dreamAgedArchiveDays`）
+  - 每次点火开头，把 `updated_at` 早于当前时间减 N 天的可巩固条目直接归档。只改 `archived` 和 `archived_at`，正文不动，可以用 `setArchived(id, false)` 恢复。
+  - 不调用 LLM，不占每类型的归档预算。单轮上限由 `dreamAgedArchiveMaxPerRun` 控制（1–500，默认 50）。`dreamAgedArchiveDays` 默认 0，表示关闭。
+
+在一份真实库（1390 条活跃记忆）上用模拟 LLM 测算：按小时点火时，整理线单轮送审条数从约 1300 降到 130–240。
+
+### 4. 只读工作区（WP5，`sessionGateReadOnlyWorkspaces`）
+
+配置是一个目录列表。会话的 `cwd` 等于其中某个目录或位于其下时：
+
+- **关闭**：会话蒸馏、续接提案落库、流水线观测和挖掘、会话文件扫描。
+- **拒绝**：`memory_save`、`memory_update`、`memory_delete`、`memory_forget`、`memory_archive`、`memory_register_document`，以及 `memory_organize` 的 `mode=apply`。
+- **照常**：记忆注入、用户设置注入、`memory_search`、`memory_list`、`memory_get`、会话内的压缩续接提示。
+
+路径会做 `~` 展开和 realpath 解析，按完整路径段做前缀匹配，`/a/bc` 不算 `/a/b` 的子目录。这个配置不受 `sessionGateEnabled` 约束，列表为空时行为不变。实现只在 `lib/`，与第 1 项一致。
+
+```yaml
+- id: dsh-mneme
+  config:
+    sessionGateReadOnlyWorkspaces:
+      - ~/Documents/private-workspace
+```
+
+## 安装
+
+本分支是给 npm 0.9.5 打的本地补丁，没有发布到 npm。用 pnpm 时，可以从本分支和 `v0.9.5` 的差异生成补丁：
+
+```sh
+git diff v0.9.5 fork/0.9.5-local --relative=dsh-mneme -- dsh-mneme > dsh-mneme@0.9.5.patch
+# 放进 profile 的 patches/，并在 package.json 的 pnpm.patchedDependencies 中引用
+```
+
+## 测试
+
+在 `dsh-mneme/` 下运行 `node --test test/*.test.js`。离开 DSH 宿主时的结果：2208 个用例里 2136 个通过，70 个失败。
+
+- 大部分失败来自缺少宿主依赖（`@deepseek-ai/dsh-tools`、`@deepseek-ai/dsh-llm` 等），原版 0.9.5 在同样环境下也会失败。
+- 本分支新增的 WP5 工具测试和消费点测试也依赖宿主。把宿主依赖链接进来后，这两组测试可以通过。
+- `lib-smoke` 的 src/lib 一致性断言失败，原因见第 1 项。
+
+<a name="upstream-readme"></a>
+
+---
+
+
 ---
 
 <a name="中文"></a>
