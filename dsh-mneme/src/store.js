@@ -180,6 +180,33 @@ CREATE TABLE IF NOT EXISTS conflict_pending (
 );
 CREATE INDEX IF NOT EXISTS idx_conflict_pending_unresolved ON conflict_pending(resolved_at);
 
+-- conflict_resolutions: 出口1（resolved_keep 台账，2026-11-04）。跨类 sweep 每轮
+-- 重新发现「相关不互斥」对（如 constraint+pitfall 同源两条），裁决器答 keep 却
+-- 无处存「已审」状态 → 下轮重来（观测 87 轮空转）。本表把**显式** keep（带理由、
+-- 全文审完）落账：pair_key 是两 id 排序后以 ':' 拼接的主键；读取端仅当 verdict=keep、
+-- 双方仍 active 且双方当前 content_hash 与台账一致（且未过 TTL）时跳过送审。
+-- 与 conflict_pending 同款纯 bookkeeping 表：不触发 write hooks，不动 memories 行。
+-- id_a/id_b 独立成列并各建单 id 索引，是为读取侧联动预留：「给一个 id 查其全部
+-- keep 边兄弟」= WHERE id_a=? OR id_b=?（index union seek）。不用 pair_key LIKE
+-- 前缀/后缀方案——后缀模式全表扫，且 LIKE 转义是额外的坑，两个等值索引更简单可靠。
+-- verdict 先只写 'keep'，schema 留扩展位。
+CREATE TABLE IF NOT EXISTS conflict_resolutions (
+  pair_key    TEXT PRIMARY KEY,
+  id_a        TEXT NOT NULL,
+  id_b        TEXT NOT NULL,
+  hash_a      TEXT,
+  hash_b      TEXT,
+  verdict     TEXT NOT NULL DEFAULT 'keep',
+  relation    TEXT,
+  reason      TEXT,
+  model       TEXT,
+  run_id      TEXT,
+  decided_at  TEXT NOT NULL,
+  updated_at  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_conflict_resolutions_id_a ON conflict_resolutions(id_a);
+CREATE INDEX IF NOT EXISTS idx_conflict_resolutions_id_b ON conflict_resolutions(id_b);
+
 -- scope_changes: v0.8.1 底座（issue #170）scope 归属的人工修正审计。显式声明
 -- （memory_save/memory_update 的 scope 参数、面板编辑）每次改变某条记忆的
 -- agent/workspace 归属都落一行：改动前后值 + 来源 + actor（tool=模型侧 /
@@ -625,6 +652,26 @@ function toConflictPending(row) {
     created_at: row.created_at,
     resolved_at: row.resolved_at ?? undefined,
     resolved_winner: row.resolved_winner ?? undefined
+  };
+}
+
+// 出口1（resolved_keep 台账）行映射；decided_at 语义 = 当前生效结论的判定时刻
+// （覆盖式 upsert 会连同 updated_at 一起刷新，TTL 才不会过期后永久重审）。
+function toConflictResolution(row) {
+  if (!row) return undefined;
+  return {
+    pair_key: row.pair_key,
+    id_a: row.id_a,
+    id_b: row.id_b,
+    hash_a: row.hash_a ?? null,
+    hash_b: row.hash_b ?? null,
+    verdict: row.verdict,
+    relation: row.relation ?? null,
+    reason: row.reason ?? null,
+    model: row.model ?? null,
+    run_id: row.run_id ?? undefined,
+    decided_at: row.decided_at,
+    updated_at: row.updated_at
   };
 }
 
@@ -2889,6 +2936,43 @@ export function createStore(path) {
   }
 
   /**
+   * 出口1（resolved_keep 台账）写入端。upsert：同 pair_key 重审后覆盖旧行，
+   * decided_at 与 updated_at 一起刷新——TTL 面向「当前结论」的判定时刻，覆盖时
+   * 不刷新 decided_at 会让过期对从此每轮重审，回到空转。语义准入（只收**显式**
+   * keep、拒绝隐式/截断/未表态）住在裁决器调用侧，本函数只做落库与 reason 截断
+   * （512 字符，够人工回看；全文可凭 run_id 查 dream_runs.decisions）。
+   */
+  function upsertConflictResolution({ pair_key, id_a, id_b, hash_a = null, hash_b = null, verdict = "keep", relation = null, reason = null, model = null, run_id = null }) {
+    if (!pair_key || !id_a || !id_b) throw new Error("conflict_resolutions: pair_key/id_a/id_b are required");
+    const now = nowIso();
+    db.prepare(
+      `INSERT INTO conflict_resolutions (pair_key, id_a, id_b, hash_a, hash_b, verdict, relation, reason, model, run_id, decided_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(pair_key) DO UPDATE SET
+         id_a = excluded.id_a, id_b = excluded.id_b, hash_a = excluded.hash_a, hash_b = excluded.hash_b,
+         verdict = excluded.verdict, relation = excluded.relation, reason = excluded.reason,
+         model = excluded.model, run_id = excluded.run_id, decided_at = excluded.decided_at, updated_at = excluded.updated_at`
+    ).run(pair_key, id_a, id_b, hash_a, hash_b, verdict, relation, String(reason ?? "").slice(0, 512) || null, model, run_id, now, now);
+    return getConflictResolution(pair_key);
+  }
+
+  /** One ledger row by pair_key (两 id 排序后 ':' 拼接), undefined on miss. */
+  function getConflictResolution(pairKey) {
+    return toConflictResolution(db.prepare("SELECT * FROM conflict_resolutions WHERE pair_key = ?").get(pairKey));
+  }
+
+  /**
+   * 读取侧联动预留（本批不接注入端，只保证数据可查）：一个 id 的全部台账兄弟边。
+   * 走 idx_conflict_resolutions_id_a / _id_b 的 index union；不按 TTL 过滤，
+   * 时效口径留给调用方。
+   */
+  function listConflictResolutionsForMemory(id) {
+    return db.prepare(
+      "SELECT * FROM conflict_resolutions WHERE id_a = ? OR id_b = ? ORDER BY updated_at DESC, pair_key"
+    ).all(id, id).map(toConflictResolution);
+  }
+
+  /**
    * v0.8.1 底座（issue #170）：scope 归属人工修正的审计行。record 描述「一次
    * 决策后的完整状态」（prev_* 为改前、next_* 为改后，NULL=global/未标注），
    * 由调用方（service.updateMemory）在 store.update 成功后写入；本函数不做
@@ -3674,6 +3758,10 @@ export function createStore(path) {
     listConflictPending,
     resolveConflictPending,
     countConflictPending,
+    // 出口1（resolved_keep 台账）：bookkeeping 三件套，不挂 write hooks。
+    upsertConflictResolution,
+    getConflictResolution,
+    listConflictResolutionsForMemory,
     saveScopeChange,
     listScopeChanges,
     // 政策轴（issue #471）：按下/松开一个作用域。纯 bookkeeping，不调

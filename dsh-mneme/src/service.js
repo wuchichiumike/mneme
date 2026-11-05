@@ -2822,6 +2822,13 @@ export function createService({ store, mirror, config, onWrite, logger, document
     listConflictQueue,
     resolveConflictPending,
     countConflictPending: () => store.countConflictPending(),
+    // 出口1（resolved_keep 台账）：bookkeeping 透传，同 saveConflictPending 那批
+    // ——不动任何记忆行，不挂 write hook。dream 侧（adjudication 写、grouped 读）
+    // 只认 service 这一个入口；listConflictResolutionsForMemory 是给未来读取侧
+    // 联动（一个 id 查其 keep 边兄弟）预留的出口。
+    upsertConflictResolution: (r) => store.upsertConflictResolution(r),
+    getConflictResolution: (k) => store.getConflictResolution(k),
+    listConflictResolutionsForMemory: (id) => store.listConflictResolutionsForMemory(id),
     // Recall evaluation trail (方案 B): audit-bookkeeping semantics like the
     // dream/recall passthroughs above — a recall_evals write is a snapshot, not
     // a memory mutation, so it never triggers write hooks.

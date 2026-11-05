@@ -2,6 +2,7 @@ import { validateDecisions, applyDecisions } from "./dream/decisions.js";
 import { clusterMemories, findPotentialConflicts, cosineSimilarity } from "./dream/clustering.js";
 import { clusterByTag, intersectEvidence } from "./dream/narratives.js";
 import { scopeKeyOf } from "./scope.js";
+import { runGroupedDream } from "./dream/grouped.js";
 // Issue #239（第 4 项）镜像到巩固：错峰时段解析与「最近的高峰结束时刻」从独立的
 // 零依赖模块 peak-hours.js 取（该模块从 summarize.js 抽出，PR #320 review）——
 // 不另写一份解析器，两份实现漂移会让「同一个时段串在两处行为不同」，那比没有
@@ -1067,6 +1068,11 @@ export function createDreamScheduler({ onRun, thresholdCount = 10, thresholdChar
   }
 
   async function runDream(ctx, service, config) {
+    if (config.dreamConsolidationMode === "grouped") return runGroupedDream(ctx, service, config, {
+      semantic, resolveRoute, resolveDreamEffort, runAuditedLlm, streamText,
+      withMaxTokensFallback, describeStreamFailure, fenceListBody, hashSnapshot,
+      buildReceipt, buildOutcome, buildRecordReceipts, maintainIndexAfterDream, reEmbedMemory
+    });
     const language = langOf(config);
     const logger = ctx.logger;
     let memories = withoutPaused(service, service.all().filter((m) => !isImportedRow(m) && !m.archived && m.type !== "summary" && m.type !== "document"));

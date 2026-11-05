@@ -254,6 +254,7 @@ const FEATURE_FLAG_INT_RANGES = {
   codingBoostFactor: [1, 5],
   dreamMinIntervalMinutes: [0, 10080],
   dreamMaxTokens: [256, 131072],
+  dreamGroupedWindow: [1, 500],
   // Issue #127：autoSummarize 节流三键（0 = 零行为变化，等同现状）。
   summarizeMinIntervalMinutes: [0, 10080],
   summarizeMaxEntriesPerRun: [0, 50],
@@ -347,6 +348,7 @@ const FEATURE_FLAG_ENUMS = {
   sleepActionSet: ["conflict", "full"],
     // Issue #125：dream 候选集构造方式（window 默认 = 现状；hybrid 并入向量组）。
     dreamCandidateMode: ["window", "hybrid"],
+    dreamConsolidationMode: ["legacy", "grouped"],
     // 本地嵌入池化：auto = 按模型族判定（BGE → cls），可显式覆盖为 cls / mean。
     localEmbedPooling: ["auto", "cls", "mean"]
 };

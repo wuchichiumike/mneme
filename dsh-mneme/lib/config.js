@@ -257,6 +257,9 @@ export const Config = z.object({
   // 记忆做 consolidation。大记忆量下全量快照会把 LLM 输入撑爆（636 记忆 →
   // 677 "missing" errors、applied=0），窗口外的旧记忆不进 snapshot。
   dreamMaxSnapshotSize: z.natural().min(1).max(1000).default(200),
+  // Opt-in only: grouped uses this window independently for each category pack.
+  dreamConsolidationMode: z.union([z.const("legacy"), z.const("grouped")]).default("legacy"),
+  dreamGroupedWindow: z.natural().min(1).max(500).default(500),
   // Issue #104 方向 2：单轮 archive 决策上限。一次性大扫除（12 条互不相关主题
   // 被批量归档，其中 8 条疑似误伤长保留类型）是失控信号，与 update 上限同类的
   // 全局闸门：skipInvalid 也不豁免，超限整单拒绝。正常清理可调高。
